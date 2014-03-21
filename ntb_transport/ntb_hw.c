@@ -53,6 +53,7 @@
 #include <linux/pci.h>
 #include <linux/random.h>
 #include <linux/slab.h>
+#include <linux/aer.h>
 #include "ntb_hw.h"
 #include "ntb_regs.h"
 
@@ -67,6 +68,14 @@ MODULE_AUTHOR("Intel Corporation");
 static bool xeon_errata_workaround = true;
 module_param(xeon_errata_workaround, bool, 0644);
 MODULE_PARM_DESC(xeon_errata_workaround, "Workaround for the Xeon Errata");
+
+static bool disable_msix;
+module_param(disable_msix, bool, 0644);
+MODULE_PARM_DESC(disable_msix, "Disable MSI-X Interrupts");
+
+static bool disable_msi;
+module_param(disable_msi, bool, 0644);
+MODULE_PARM_DESC(disable_msi, "Disable MSI Interrupts");
 
 enum {
 	NTB_CONN_TRANSPARENT = 0,
@@ -522,8 +531,6 @@ static void bwd_recover_link(struct ntb_device *ndev)
 
 static void ntb_link_event(struct ntb_device *ndev, int link_state)
 {
-	unsigned int event;
-
 	if (ndev->link_status == link_state)
 		return;
 
@@ -532,7 +539,6 @@ static void ntb_link_event(struct ntb_device *ndev, int link_state)
 
 		dev_info(&ndev->pdev->dev, "Link Up\n");
 		ndev->link_status = NTB_LINK_UP;
-		event = NTB_EVENT_HW_LINK_UP;
 
 		if (ndev->hw_type == BWD_HW ||
 		    ndev->conn_type == NTB_CONN_TRANSPARENT)
@@ -549,16 +555,28 @@ static void ntb_link_event(struct ntb_device *ndev, int link_state)
 		ndev->link_speed = (status & NTB_LINK_SPEED_MASK);
 		dev_info(&ndev->pdev->dev, "Link Width %d, Link Speed %d\n",
 			 ndev->link_width, ndev->link_speed);
+		schedule_delayed_work(&ndev->hb_timer, NTB_HB_TIMEOUT);
+		schedule_delayed_work(&ndev->hb_alive_timer,
+				      NTB_HB_TIMEOUT * 2);
 	} else {
+		if (ndev->hw_type == BWD_HW) {
+			cancel_delayed_work_sync(&ndev->hb_timer);
+			cancel_delayed_work_sync(&ndev->hb_alive_timer);
+		} else {
+			cancel_delayed_work(&ndev->hb_timer);
+			cancel_delayed_work(&ndev->hb_alive_timer);
+		}
+		ndev->hb_alive = false;
+
 		dev_info(&ndev->pdev->dev, "Link Down\n");
 		ndev->link_status = NTB_LINK_DOWN;
-		event = NTB_EVENT_HW_LINK_DOWN;
 		/* Don't modify link width/speed, we need it in link recovery */
-	}
 
-	/* notify the upper layer if we have an event change */
-	if (ndev->event_cb)
-		ndev->event_cb(ndev->ntb_transport, event);
+		/* notify the upper layer if we have an event change */
+		if (ndev->event_cb)
+			ndev->event_cb(ndev->ntb_transport,
+				       NTB_EVENT_HW_LINK_DOWN);
+	}
 }
 
 static int ntb_link_status(struct ntb_device *ndev)
@@ -605,7 +623,7 @@ static void bwd_link_recovery(struct work_struct *work)
 	 * the driver will be stuck in this loop forever.  Add a random interval
 	 * to the recovery time to prevent this race.
 	 */
-	msleep(BWD_LINK_RECOVERY_TIME + random32() % BWD_LINK_RECOVERY_TIME);
+	msleep(BWD_LINK_RECOVERY_TIME + prandom_u32() % BWD_LINK_RECOVERY_TIME);
 
 	status32 = readl(ndev->reg_base + BWD_LTSSMSTATEJMP_OFFSET);
 	if (status32 & BWD_LTSSMSTATEJMP_FORCEDETECT)
@@ -627,24 +645,24 @@ static void bwd_link_recovery(struct work_struct *work)
 			goto retry;
 	}
 
-	schedule_delayed_work(&ndev->hb_timer, NTB_HB_TIMEOUT);
+	schedule_delayed_work(&ndev->link_timer, NTB_LINK_TIMEOUT);
 	return;
 
 retry:
-	schedule_delayed_work(&ndev->lr_timer, NTB_HB_TIMEOUT);
+	schedule_delayed_work(&ndev->lr_timer, NTB_LINK_TIMEOUT);
 }
 
 /* BWD doesn't have link status interrupt, poll on that platform */
 static void bwd_link_poll(struct work_struct *work)
 {
 	struct ntb_device *ndev = container_of(work, struct ntb_device,
-					       hb_timer.work);
+					       link_timer.work);
 	unsigned long ts = jiffies;
 
 	/* If we haven't gotten an interrupt in a while, check the BWD link
 	 * status bit
 	 */
-	if (ts > ndev->last_ts + NTB_HB_TIMEOUT) {
+	if (ts > ndev->last_ts + NTB_LINK_TIMEOUT) {
 		int rc = ntb_link_status(ndev);
 		if (rc)
 			dev_err(&ndev->pdev->dev,
@@ -661,15 +679,47 @@ static void bwd_link_poll(struct work_struct *work)
 		}
 	}
 
-	schedule_delayed_work(&ndev->hb_timer, NTB_HB_TIMEOUT);
+	schedule_delayed_work(&ndev->link_timer, NTB_LINK_TIMEOUT);
 }
 
 static int ntb_xeon_setup(struct ntb_device *ndev)
 {
 	int rc;
 	u8 val;
+	u32 val32;
 
 	ndev->hw_type = SNB_HW;
+
+	/* Enable non-standard AER */
+	rc = pci_write_config_dword(ndev->pdev, SNB_RPERRCMD_OFFSET,
+				    SNB_AER_FATAL_ENABLE |
+				    SNB_AER_NONFATAL_ENABLE |
+				    SNB_AER_CORRERR_ENABLE);
+	if (rc)
+		dev_err(&ndev->pdev->dev, "AER enablement failed, continuing on anyway.\n");
+
+	/* Disable SLD AER event, as this will show up as a Link down interrupt
+	 * in B2B mode.  Also, make the error not fatal.  Otherwise, any
+	 * non-fatal error will be escilated to fatal when it is detected due to
+	 * a fatal SLD error being detected but masked.
+	 */
+	rc = pci_read_config_dword(ndev->pdev, SNB_UNCERRMSK_OFFSET, &val32);
+	if (rc)
+		return rc;
+
+	val32 |= SNB_AER_SLDMASK;
+	rc = pci_write_config_dword(ndev->pdev, SNB_UNCERRMSK_OFFSET, val32);
+	if (rc)
+		return rc;
+
+	rc = pci_read_config_dword(ndev->pdev, SNB_UNCERRSEV_OFFSET, &val32);
+	if (rc)
+		return rc;
+
+	val32 &= ~SNB_AER_SLDSEV;
+	rc = pci_write_config_dword(ndev->pdev, SNB_UNCERRSEV_OFFSET, val32);
+	if (rc)
+		return rc;
 
 	rc = pci_read_config_byte(ndev->pdev, NTB_PPD_OFFSET, &val);
 	if (rc)
@@ -785,7 +835,7 @@ static int ntb_xeon_setup(struct ntb_device *ndev)
 				/* B2B_XLAT_OFFSET is a 64bit register, but can
 				 * only take 32bit writes
 				 */
-				writel(SNB_MBAR01_USD_ADDR & 0xffffffff,
+				writel(SNB_MBAR01_DSD_ADDR & 0xffffffff,
 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETL);
 				writel(SNB_MBAR01_USD_ADDR >> 32,
 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETU);
@@ -878,6 +928,10 @@ static int ntb_bwd_setup(struct ntb_device *ndev)
 
 	ndev->hw_type = BWD_HW;
 
+	rc = pci_enable_pcie_error_reporting(ndev->pdev);
+	if (rc)
+		dev_err(&ndev->pdev->dev, "AER enablement failed, continuing on anyway.\n");
+
 	rc = pci_read_config_dword(ndev->pdev, NTB_PPD_OFFSET, &val);
 	if (rc)
 		return rc;
@@ -897,12 +951,6 @@ static int ntb_bwd_setup(struct ntb_device *ndev)
 	else
 		ndev->dev_type = NTB_DEV_USD;
 
-	/* Initiate PCI-E link training */
-	rc = pci_write_config_dword(ndev->pdev, NTB_PPD_OFFSET,
-				    val | BWD_PPD_INIT_LINK);
-	if (rc)
-		return rc;
-
 	ndev->reg_ofs.ldb = ndev->reg_base + BWD_PDOORBELL_OFFSET;
 	ndev->reg_ofs.ldb_mask = ndev->reg_base + BWD_PDBMSK_OFFSET;
 	ndev->reg_ofs.rdb = ndev->reg_base + BWD_B2B_DOORBELL_OFFSET;
@@ -920,9 +968,9 @@ static int ntb_bwd_setup(struct ntb_device *ndev)
 	ndev->bits_per_vector = BWD_DB_BITS_PER_VEC;
 
 	/* Since bwd doesn't have a link interrupt, setup a poll timer */
-	INIT_DELAYED_WORK(&ndev->hb_timer, bwd_link_poll);
+	INIT_DELAYED_WORK(&ndev->link_timer, bwd_link_poll);
 	INIT_DELAYED_WORK(&ndev->lr_timer, bwd_link_recovery);
-	schedule_delayed_work(&ndev->hb_timer, NTB_HB_TIMEOUT);
+	schedule_delayed_work(&ndev->link_timer, NTB_LINK_TIMEOUT);
 
 	return 0;
 }
@@ -970,7 +1018,7 @@ static int ntb_device_setup(struct ntb_device *ndev)
 static void ntb_device_free(struct ntb_device *ndev)
 {
 	if (ndev->hw_type == BWD_HW) {
-		cancel_delayed_work_sync(&ndev->hb_timer);
+		cancel_delayed_work_sync(&ndev->link_timer);
 		cancel_delayed_work_sync(&ndev->lr_timer);
 	}
 }
@@ -1026,13 +1074,173 @@ static irqreturn_t xeon_callback_msix_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static void ntb_hw_link_up(struct ntb_device *ndev)
+{
+	if (ndev->hw_type == BWD_HW) {
+		u32 val;
+		int rc;
+
+		rc = pci_read_config_dword(ndev->pdev, NTB_PPD_OFFSET, &val);
+		if (rc)
+			return;
+
+		/* Initiate PCI-E link training */
+		rc = pci_write_config_dword(ndev->pdev, NTB_PPD_OFFSET,
+					    val | BWD_PPD_INIT_LINK);
+		if (rc)
+			return;
+	} else {
+		if (ndev->conn_type == NTB_CONN_TRANSPARENT)
+			ntb_link_event(ndev, NTB_LINK_UP);
+		else {
+			u32 ntb_cntl;
+
+			/* Let's bring the NTB link up */
+			ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
+			ntb_cntl &= ~(NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK);
+			ntb_cntl |= NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP;
+			ntb_cntl |= NTB_CNTL_P2S_BAR45_SNOOP | NTB_CNTL_S2P_BAR45_SNOOP;
+			writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
+		}
+	}
+}
+
+static void ntb_hw_link_down(struct ntb_device *ndev)
+{
+	if (ndev->hw_type == BWD_HW) {
+		u32 val;
+		int rc;
+
+		rc = pci_read_config_dword(ndev->pdev, NTB_PPD_OFFSET, &val);
+		if (rc)
+			return;
+
+		/* Disable PCI-E link training */
+		rc = pci_write_config_dword(ndev->pdev, NTB_PPD_OFFSET,
+					    val & ~BWD_PPD_INIT_LINK);
+		if (rc)
+			return;
+	} else {
+		u32 ntb_cntl;
+
+		if (ndev->conn_type == NTB_CONN_TRANSPARENT) {
+			ntb_link_event(ndev, NTB_LINK_DOWN);
+			return;
+		}
+
+		/* Bring NTB link down */
+		ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
+		ntb_cntl &= ~(NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP);
+		ntb_cntl &= ~(NTB_CNTL_P2S_BAR45_SNOOP | NTB_CNTL_S2P_BAR45_SNOOP);
+		ntb_cntl |= NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK;
+		writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
+	}
+}
+
+static void ntb_aer_fatal_recover(struct ntb_device *ndev)
+{
+	u16 val;
+	int rc;
+
+	/* Bad things are happening.  Bring down the link to the remote system,
+	 * stop all data, and retrain the link.  Hopefully retraining the link
+	 * is sufficient to recover from the fatal error.
+	 */
+
+	ntb_link_event(ndev, NTB_LINK_DOWN);
+
+	/* Bring NTB link down */
+	ntb_hw_link_down(ndev);
+
+	rc = pci_read_config_word(ndev->pdev, SNB_LNKCON_OFFSET, &val);
+	if (rc)
+		return;
+
+	val |= SNB_LNKCON_RETRAIN;
+	rc = pci_write_config_word(ndev->pdev, SNB_LNKCON_OFFSET, val);
+	if (rc)
+		return;
+
+	/* Let's bring the NTB link up */
+	ntb_hw_link_up(ndev);
+}
+
+static void xeon_aer_check(struct ntb_device *ndev)
+{
+	u32 val;
+	int rc;
+
+	rc = pci_read_config_dword(ndev->pdev, SNB_RPERRSTS_OFFSET, &val);
+	if (rc)
+		return;
+
+	/* Nothing to see here, move along */
+	if (!val)
+		return;
+
+	if (val & SNB_AER_CORR_ERR) {
+		u32 err;
+
+		rc = pci_read_config_dword(ndev->pdev, SNB_CORERRSTS_OFFSET,
+					   &err);
+		if (rc) {
+			dev_info(&ndev->pdev->dev, "Error reading CORERRSTS\n");
+			return;
+		}
+
+		dev_warn(&ndev->pdev->dev, "AER Correctable Error Found - %x\n",
+			 err);
+
+		rc = pci_write_config_dword(ndev->pdev, SNB_CORERRSTS_OFFSET,
+					    err);
+		if (rc) {
+			dev_info(&ndev->pdev->dev, "Error writing CORERRSTS\n");
+			return;
+		}
+	}
+
+	if (val & (SNB_AER_NONFATAL_ERR | SNB_AER_FATAL_ERR)) {
+		u32 err;
+
+		rc = pci_read_config_dword(ndev->pdev, SNB_UNCERRSTS_OFFSET,
+					   &err);
+		if (rc) {
+			dev_info(&ndev->pdev->dev, "Error writing UNCERRSTS\n");
+			return;
+		}
+
+		if (val & SNB_AER_FATAL_ERR)
+			dev_err(&ndev->pdev->dev, "AER Fatal Error Found - %x\n",
+				err);
+		else
+			dev_warn(&ndev->pdev->dev, "AER Nonfatal Error Found - %x\n",
+				 err);
+
+		rc = pci_write_config_dword(ndev->pdev, SNB_UNCERRSTS_OFFSET,
+					    err);
+		if (rc) {
+			dev_info(&ndev->pdev->dev, "Error writing UNCERRSTS\n");
+			return;
+		}
+
+		if (val & SNB_AER_FATAL_ERR)
+			ntb_aer_fatal_recover(ndev);
+	}
+
+	pci_write_config_dword(ndev->pdev, SNB_RPERRSTS_OFFSET, val);
+}
+
 /* Since we do not have a HW doorbell in BWD, this is only used in JF/JT */
 static irqreturn_t xeon_event_msix_irq(int irq, void *dev)
 {
 	struct ntb_device *ndev = dev;
 	int rc;
 
+	/* This interrupt is shared for AER events and Link Status */
+
 	dev_dbg(&ndev->pdev->dev, "MSI-X irq %d received for Events\n", irq);
+
+	xeon_aer_check(ndev);
 
 	rc = ntb_link_status(ndev);
 	if (rc)
@@ -1084,16 +1292,18 @@ static int ntb_setup_msix(struct ntb_device *ndev)
 	struct pci_dev *pdev = ndev->pdev;
 	struct msix_entry *msix;
 	int msix_entries;
-	int rc, i, pos;
+	int rc, i;
 	u16 val;
 
-	pos = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
-	if (!pos) {
+	if (disable_msix)
+		return -EACCES;
+
+	if (!pdev->msix_cap) {
 		rc = -EIO;
 		goto err;
 	}
 
-	rc = pci_read_config_word(pdev, pos + PCI_MSIX_FLAGS, &val);
+	rc = pci_read_config_word(pdev, pdev->msix_cap + PCI_MSIX_FLAGS, &val);
 	if (rc)
 		goto err;
 
@@ -1193,6 +1403,9 @@ static int ntb_setup_msi(struct ntb_device *ndev)
 	struct pci_dev *pdev = ndev->pdev;
 	int rc;
 
+	if (disable_msi)
+		return -EACCES;
+
 	rc = pci_enable_msi(pdev);
 	if (rc)
 		return rc;
@@ -1282,7 +1495,6 @@ static void ntb_free_interrupts(struct ntb_device *ndev)
 				free_irq(msix->vector, &ndev->db_cb[i]);
 		}
 		pci_disable_msix(pdev);
-		kfree(ndev->msix_entries);
 	} else {
 		free_irq(pdev->irq, ndev);
 
@@ -1346,37 +1558,68 @@ static void ntb_free_debugfs(struct ntb_device *ndev)
 	}
 }
 
-static void ntb_hw_link_up(struct ntb_device *ndev)
+static void ntb_hb_poll(struct work_struct *work)
 {
-	if (ndev->conn_type == NTB_CONN_TRANSPARENT)
-		ntb_link_event(ndev, NTB_LINK_UP);
-	else {
-		u32 ntb_cntl;
+	struct ntb_device *ndev = container_of(work, struct ntb_device,
+					       hb_timer.work);
 
-		/* Let's bring the NTB link up */
-		ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
-		ntb_cntl &= ~(NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK);
-		ntb_cntl |= NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP;
-		ntb_cntl |= NTB_CNTL_P2S_BAR45_SNOOP | NTB_CNTL_S2P_BAR45_SNOOP;
-		writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
-	}
+	ntb_ring_doorbell(ndev, ndev->max_cbs);
+	schedule_delayed_work(&ndev->hb_timer, NTB_HB_TIMEOUT);
 }
 
-static void ntb_hw_link_down(struct ntb_device *ndev)
+static void ntb_hb_alive_poll(struct work_struct *work)
 {
-	u32 ntb_cntl;
+	struct ntb_device *ndev = container_of(work, struct ntb_device,
+					       hb_alive_timer.work);
+	ndev->hb_alive = false;
+	dev_info(&ndev->pdev->dev, "NTB Heartbeat failure\n");
 
-	if (ndev->conn_type == NTB_CONN_TRANSPARENT) {
-		ntb_link_event(ndev, NTB_LINK_DOWN);
-		return;
-	}
+	/* notify the upper layer if we have an event change */
+	if (ndev->event_cb)
+		ndev->event_cb(ndev->ntb_transport, NTB_EVENT_HW_LINK_DOWN);
+}
 
-	/* Bring NTB link down */
-	ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
-	ntb_cntl &= ~(NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP);
-	ntb_cntl &= ~(NTB_CNTL_P2S_BAR45_SNOOP | NTB_CNTL_S2P_BAR45_SNOOP);
-	ntb_cntl |= NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK;
-	writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
+static int ntb_hb_irq(void *data, int db_num)
+{
+	struct ntb_device *ndev = data;
+	bool alive = ndev->hb_alive;
+
+	mod_delayed_work(system_wq, &ndev->hb_alive_timer, NTB_HB_TIMEOUT * 2);
+
+	ndev->hb_alive = true;
+	/* notify the upper layer if we have an event change */
+	if (ndev->event_cb && !alive)
+		ndev->event_cb(ndev->ntb_transport, NTB_EVENT_HW_LINK_UP);
+
+	return 0;
+}
+
+static int ntb_hb_init(struct ntb_device *ndev)
+{
+	int rc;
+
+	INIT_DELAYED_WORK(&ndev->hb_timer, ntb_hb_poll);
+	INIT_DELAYED_WORK(&ndev->hb_alive_timer, ntb_hb_alive_poll);
+
+	/* Use the last available db for hb */
+	rc = ntb_register_db_callback(ndev, ndev->max_cbs - 1, ndev,
+				      ntb_hb_irq);
+	if (rc)
+		return rc;
+
+	/* decrement max_cbs to reserve the last db for hb */
+	ndev->max_cbs--;
+
+	return 0;
+}
+
+static void ntb_hb_free(struct ntb_device *ndev)
+{
+	cancel_delayed_work_sync(&ndev->hb_alive_timer);
+	cancel_delayed_work_sync(&ndev->hb_timer);
+
+	ndev->max_cbs++;
+	ntb_unregister_db_callback(ndev, ndev->max_cbs);
 }
 
 static int ntb_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -1467,10 +1710,17 @@ static int ntb_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		goto err6;
 
+	rc = ntb_hb_init(ndev);
+	if (rc)
+		goto err7;
+
+	/* Let's bring the NTB link up */
 	ntb_hw_link_up(ndev);
 
 	return 0;
 
+err7:
+	ntb_transport_free(ndev->ntb_transport);
 err6:
 	ntb_free_interrupts(ndev);
 err5:
@@ -1498,7 +1748,9 @@ static void ntb_pci_remove(struct pci_dev *pdev)
 	struct ntb_device *ndev = pci_get_drvdata(pdev);
 	int i;
 
+	/* Bring NTB link down */
 	ntb_hw_link_down(ndev);
+	ntb_hb_free(ndev);
 
 	ntb_transport_free(ndev->ntb_transport);
 
@@ -1511,30 +1763,151 @@ static void ntb_pci_remove(struct pci_dev *pdev)
 
 	iounmap(ndev->reg_base);
 	pci_release_selected_regions(pdev, NTB_BAR_MASK);
+	pci_disable_pcie_error_reporting(pdev);
 	pci_disable_device(pdev);
 	ntb_free_debugfs(ndev);
 	kfree(ndev);
 }
+
+/* PCI bus error detected on this device */
+static pci_ers_result_t
+ntb_pci_error_detected(struct pci_dev *pdev, enum pci_channel_state error)
+{
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+
+	ntb_link_event(ndev, NTB_LINK_DOWN);
+
+	switch (error) {
+	case pci_channel_io_normal:
+		dev_warn(&pdev->dev, "PCI AER non-fatal error detected");
+		return PCI_ERS_RESULT_CAN_RECOVER;
+	case pci_channel_io_frozen:
+		dev_err(&pdev->dev, "PCI AER fatal error detected");
+		ntb_device_free(ndev);
+		pci_disable_device(pdev);
+		return PCI_ERS_RESULT_NEED_RESET;
+	case pci_channel_io_perm_failure:
+		dev_err(&pdev->dev, "PCI error detected and unable to recover");
+		return PCI_ERS_RESULT_DISCONNECT;
+	default:
+		dev_err(&pdev->dev, "Unknown PCI Error");
+		return PCI_ERS_RESULT_NONE;
+	}
+}
+
+/* PCI Express link has been reset */
+static pci_ers_result_t ntb_pci_link_reset(struct pci_dev *pdev)
+{
+	dev_err(&pdev->dev, "PCI AER: Link Reset");
+	BUG();
+	return PCI_ERS_RESULT_NONE;
+}
+
+/* MMIO has been re-enabled, but not DMA */
+static pci_ers_result_t ntb_pci_mmio_enabled(struct pci_dev *pdev)
+{
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+
+	dev_err(&pdev->dev, "PCI AER: MMIO re-enabled");
+
+	/* Bring NTB link down */
+	ntb_hw_link_down(ndev);
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+/* PCI slot has been reset */
+static pci_ers_result_t ntb_pci_slot_reset(struct pci_dev *pdev)
+{
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+	int rc;
+
+	dev_err(&pdev->dev, "PCI AER: Slot Reset");
+
+	rc = pci_enable_device(pdev);
+	if (rc)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	pci_set_master(pdev);
+	pci_restore_state(pdev);
+	pci_save_state(pdev);
+	pci_cleanup_aer_uncorrect_error_status(pdev);
+
+	rc = ntb_device_setup(ndev);
+	if (rc)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+/* Device driver may resume normal operations */
+static void ntb_pci_resume(struct pci_dev *pdev)
+{
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+
+	dev_err(&pdev->dev, "PCI AER error recovered");
+
+	/* Let's bring the NTB link up */
+	ntb_hw_link_up(ndev);
+}
+
+static struct pci_error_handlers ntb_pci_err_handler = {
+	.error_detected = ntb_pci_error_detected,
+	.mmio_enabled = ntb_pci_mmio_enabled,
+	.link_reset = ntb_pci_link_reset,
+	.slot_reset = ntb_pci_slot_reset,
+	.resume = ntb_pci_resume,
+};
+
+#ifdef CONFIG_PM
+static int ntb_suspend(struct device *device)
+{
+	struct pci_dev *pdev = to_pci_dev(device);
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+
+	ntb_hw_link_down(ndev);
+
+	/* FIXME - bringing the link down should disable interrupts, but how
+	 * does this work on BWD or in RP mode?
+	 */
+
+	if (ndev->hw_type == BWD_HW) {
+		cancel_delayed_work_sync(&ndev->link_timer);
+		cancel_delayed_work_sync(&ndev->lr_timer);
+		ntb_link_event(ndev, NTB_LINK_DOWN);
+	}
+
+	return pci_set_power_state(pdev, PCI_D3hot);
+}
+
+static int ntb_resume(struct device *device)
+{
+	struct pci_dev *pdev = to_pci_dev(device);
+	struct ntb_device *ndev = pci_get_drvdata(pdev);
+	int rc;
+
+	rc = pci_set_power_state(pdev, PCI_D0);
+	if (rc)
+		return rc;
+
+	ntb_hw_link_up(ndev);
+
+	if (ndev->hw_type == BWD_HW)
+		schedule_delayed_work(&ndev->link_timer, NTB_LINK_TIMEOUT);
+
+	return 0;
+}
+#endif
+
+SIMPLE_DEV_PM_OPS(ntb_pm_ops, ntb_suspend, ntb_resume);
 
 static struct pci_driver ntb_pci_driver = {
 	.name = KBUILD_MODNAME,
 	.id_table = ntb_pci_tbl,
 	.probe = ntb_pci_probe,
 	.remove = ntb_pci_remove,
+	.err_handler = &ntb_pci_err_handler,
+//FIXME - this should be NULLed when no PM.  Build without PM to verify.
+	.driver.pm = &ntb_pm_ops,
 };
-
-static int __init ntb_init_module(void)
-{
-	pr_info("%s: %s, version %s\n", KBUILD_MODNAME, NTB_NAME, NTB_VER);
-
-	return pci_register_driver(&ntb_pci_driver);
-}
-module_init(ntb_init_module);
-
-static void __exit ntb_exit_module(void)
-{
-	pci_unregister_driver(&ntb_pci_driver);
-
-	pr_info("%s: Driver removed\n", KBUILD_MODNAME);
-}
-module_exit(ntb_exit_module);
+module_pci_driver(ntb_pci_driver);
